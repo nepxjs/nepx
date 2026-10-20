@@ -193,7 +193,27 @@ export interface SecurityConfig {
   /** Never serve /.env, /.git ... from public/ (".well-known" stays allowed). Default true. */
   blockDotfiles?: boolean;
 }
+export interface TurboConfig {
+  /** Keep the options but switch turbo off. Default true (an options object turns turbo on). */
+  enabled?: boolean;
+  /** Cache compiled JSX/TS on disk, keyed by content. Default true. */
+  cache?: boolean;
+  /** Where the caches live. Default node_modules/.cache/nepx (or the OS temp dir without node_modules). */
+  cacheDir?: string;
+  /** Node's V8 compile cache for Nepx and dependencies (Node >= 22.1, ignored on older versions). Default true. */
+  compileCache?: boolean;
+  /** Routes inspected / pages prerendered at the same time. Default: CPU count, between 2 and 8. */
+  concurrency?: number;
+  /** dev: a save that did not change the file's content does not restart the server. Default true. */
+  skipUnchanged?: boolean;
+  /** dev: extra globs (or RegExps, tested on the "/"-separated path) that never restart the server, e.g. "generated/**". Added to the built-in list (logs, swap files, tests, coverage, dist). */
+  watchIgnore?: (string | RegExp)[];
+  /** start: import the route modules in the background right after listening. Default true. */
+  warmup?: boolean;
+}
 export interface NepxConfig {
+  /** Faster dev restarts, builds and cold starts. Off by default; also `--turbo` / `--no-turbo` and NEPX_TURBO=1|0. */
+  turbo?: boolean | TurboConfig;
   port?: number;
   /** Server hardening. `false` turns every protection off. */
   security?: SecurityConfig | false;
