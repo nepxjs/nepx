@@ -1,5 +1,5 @@
-// React + Next.js style hooks (isomorphic: safe to render on the server).
-import { useCallback, useEffect, useRef, useState, useContext } from "react";
+// React + Router hooks (isomorphic: safe to render on the server).
+import { useCallback, useEffect, useRef, useState, useContext, createContext } from "react";
 import { RouterContext } from "./link.js";
 import { isNotFoundError } from "./shared.js";
 
@@ -51,7 +51,7 @@ export function useOptimisticAction(fn, current, reducer) {
   return { ...base, value: optimistic ? optimistic.value : current };
 }
 
-// ---------------------------------------------------------------------------------------------- Next.js style hooks
+// ---------------------------------------------------------------------------------------------- Router hooks
 const segmentsOf = (pathname) => pathname.split("/").filter(Boolean).map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
 /** Active path segments below the root layout (`/blog/hello` -> ["blog","hello"]). Pass `depth` to skip that many leading segments. */
 export function useSelectedLayoutSegments(depth = 0) { return segmentsOf(useContext(RouterContext).pathname).slice(depth); }
@@ -80,4 +80,18 @@ export function useReportWebVitals(cb) {
     watch("layout-shift", "CLS", (e) => e.value);
     return () => obs.forEach((o) => o.disconnect());
   }, []);
+}
+
+// ---------------------------------------------------------------------------------------------- useServerInsertedHTML
+/** Collector the server renderer provides while it renders a page (null in the browser, where the hook does nothing). */
+export const InsertedHtmlContext = createContext(null);
+
+/**
+ * useServerInsertedHTML(() => <style>...</style>) - add markup to the <head> of the server-rendered page (CSS-in-JS, inline scripts).
+ * The callback runs once the shell has rendered, so it sees what the components above registered; nothing happens in the browser.
+ * Components can render more than once: guard against duplicates yourself (a ref or a Set) as usual.
+ */
+export function useServerInsertedHTML(callback) {
+  const c = useContext(InsertedHtmlContext);
+  if (c) c.push(callback);
 }

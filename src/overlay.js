@@ -1,4 +1,4 @@
-// Development error overlay (like the Next.js one): turns any server, build or browser error into
+// Development error overlay (dev overlay): turns any server, build or browser error into
 // a readable panel with the message, a code frame of the failing source line and a call stack.
 // Only used by `nepx dev`; production never loads this and never exposes messages or stacks.
 import { readFileSync } from "node:fs";

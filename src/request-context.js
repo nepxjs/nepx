@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import { DYNAMIC } from "./shared.js";
 
 export const als = new AsyncLocalStorage();
+/** Active while a "use cache" function runs: { tags:Set, life } - cacheTag() and cacheLife() write into it. */
+export const cacheScope = new AsyncLocalStorage();
 
 export class DynamicUsageError extends Error {
   constructor(fn) {
@@ -16,7 +18,7 @@ export class DynamicUsageError extends Error {
 
 /** A fresh per-request store (the server creates one per request, ISR regeneration one per render). */
 export function newStore(headers = new Headers(), cookies = {}) {
-  return { headers, cookies, dynamic: false, setCookies: [], afterTasks: [], tags: new Set() };
+  return { headers, cookies, dynamic: false, setCookies: [], afterTasks: [], tags: new Set(), locale: null };
 }
 
 function store(fn) {
@@ -112,14 +114,24 @@ export function after(fn) {
   st.afterTasks.push(fn);
 }
 
+/** Older name for after(). */
+export const unstable_after = after;
+
 /** `await connection()` marks the page as dynamic: it needs a real request and is never prerendered or ISR-cached. */
 export async function connection() { store("connection"); }
-/** Opt the current render out of prerendering / ISR caching (Next.js `unstable_noStore`). */
+/** Opt the current render out of prerendering / ISR caching (`unstable_noStore`). */
 export function unstable_noStore() { store("unstable_noStore"); }
 
 /** Tag the page being rendered; `revalidateTag(tag)` later drops its cached (ISR) copy. A no-op while prerendering at build time. */
 export function cacheTag(...tags) {
+  for (const t of tags) if (typeof t !== "string" || !t) throw new TypeError("cacheTag(): tags must be non-empty strings");
+  const scope = cacheScope.getStore(); // inside a "use cache" function the tags belong to that cache entry (and reach the page through it)
+  if (scope) for (const t of tags) scope.tags.add(t);
   const st = als.getStore();
-  if (!st) return;
-  for (const t of tags) { if (typeof t !== "string" || !t) throw new TypeError("cacheTag(): tags must be non-empty strings"); st.tags.add(t); }
+  if (st) for (const t of tags) st.tags.add(t);
+}
+
+/** getLocale() - the locale of the current request (config.i18n), e.g. "id"; the default locale outside a request; null when i18n is off. */
+export function getLocale() {
+  return als.getStore()?.locale ?? process.env.NEPX_DEFAULT_LOCALE ?? null;
 }

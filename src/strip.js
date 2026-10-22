@@ -12,7 +12,7 @@ function skipString(src, i, q) {
 }
 
 /** Returns the index just after the bracket matching src[start]. */
-function skipBalanced(src, start, open, close) {
+export function skipBalanced(src, start, open, close) {
   let depth = 0;
   for (let i = start; i < src.length; i++) {
     const c = src[i];
@@ -56,6 +56,6 @@ function stripOne(src, name) {
   return src.slice(0, m.index) + src.slice(end);
 }
 
-export function stripServerExports(source, names = ["getServerSideProps", "generateStaticParams", "generateMetadata"]) {
+export function stripServerExports(source, names = ["getServerSideProps", "getStaticProps", "getStaticPaths", "generateStaticParams", "generateMetadata"]) {
   return names.reduce((s, n) => stripOne(s, n), source);
 }

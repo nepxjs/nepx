@@ -1,29 +1,34 @@
 import { lstatSync, readdirSync, existsSync } from "node:fs";
+import { mergePages } from "./pages-dir.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { NepxError, PAGE_STATUSES } from "./errors/index.js";
 import { pool } from "./turbo.js";
+import { isCustomAppGip } from "./shared.js";
 
-export const EXTS = [".ksx", ".jsx", ".tsx", ".ts", ".js"];
+const ALL_EXTS = [".ksx", ".jsx", ".tsx", ".ts", ".js"];
+export const EXTS = [...ALL_EXTS]; // config.pageExtensions narrows it (in place, so every importer sees it)
+export function setPageExtensions(list) { EXTS.splice(0, EXTS.length, ...ALL_EXTS.filter((e) => !list || list.includes(e))); }
+try { setPageExtensions(process.env.NEPX_PAGE_EXTENSIONS ? JSON.parse(process.env.NEPX_PAGE_EXTENSIONS) : null); } catch { /* validated by loadConfig */ }
 export const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 const DYNAMIC = /^\[([A-Za-z_][A-Za-z0-9_]*)\]$/;
 const CATCHALL = /^\[\.\.\.([A-Za-z_][A-Za-z0-9_]*)\]$/;
 const OPTIONAL = /^\[\[\.\.\.([A-Za-z_][A-Za-z0-9_]*)\]\]$/;
 const GROUP = /^\((.+)\)$/;
 const STATIC = /^[A-Za-z0-9._~-]+$/;
-/** app/sitemap.js, app/robots.js, app/manifest.js (root only): generated files, like the Next.js metadata routes. */
+/** app/sitemap.js, app/robots.js, app/manifest.js (root only): generated files, metadata routes. */
 export const META_ROUTES = { sitemap: "sitemap.xml", robots: "robots.txt", manifest: "manifest.webmanifest" };
 
 /** "src" when the project keeps its code in src/app, otherwise "" (app/ at the project root). */
 export const baseDir = (root) => (existsSync(path.join(root, "src", "app")) ? "src" : "");
 export const appDirOf = (root) => path.join(root, baseDir(root), "app");
 
-const splitExt = (name) => {
+export const splitExt = (name) => {
   const ext = EXTS.find((e) => name.endsWith(e));
   return ext ? [name.slice(0, -ext.length), ext] : null;
 };
 
-function walk(dir, base = "") {
+export function walk(dir, base = "") {
   if (!existsSync(dir)) return [];
   const out = [];
   for (const name of readdirSync(dir).sort()) {
@@ -57,7 +62,7 @@ function parseOne(p) {
  * Directory names -> route segments. `start` are the segments the parts continue from (a @slot's parent URL).
  * With allowIntercept, (.)name / (..)name / (..)(..)name / (...)name climb that many ROUTE segments (not folders) before adding name.
  */
-function parseDirSegments(parts, { start = [], allowIntercept = false } = {}) {
+export function parseDirSegments(parts, { start = [], allowIntercept = false } = {}) {
   const segs = [...start];
   let intercept = false;
   for (const p of parts) {
@@ -79,10 +84,10 @@ function parseDirSegments(parts, { start = [], allowIntercept = false } = {}) {
   if (ci !== -1 && ci !== segs.length - 1) throw new NepxError(`Catch-all segment [...${segs[ci].catchall || segs[ci].optional}] must be the last segment`);
   return { segs, intercept };
 }
-const urlPathOf = (segs) => (segs.length ? segs.map((s) => "/" + (s.optional ? ":" + s.optional + "*?" : s.catchall ? ":" + s.catchall + "*" : s.param ? ":" + s.param : s.static)).join("") : "/");
+export const urlPathOf = (segs) => (segs.length ? segs.map((s) => "/" + (s.optional ? ":" + s.optional + "*?" : s.catchall ? ":" + s.catchall + "*" : s.param ? ":" + s.param : s.static)).join("") : "/");
 
 const rank = (s) => (s.optional ? 3 : s.catchall ? 2 : s.param ? 1 : 0);
-function compareRoutes(a, b) {
+export function compareRoutes(a, b) {
   const n = Math.min(a.segments.length, b.segments.length);
   for (let i = 0; i < n; i++) {
     const d = rank(a.segments[i]) - rank(b.segments[i]);
@@ -93,7 +98,7 @@ function compareRoutes(a, b) {
 }
 
 /**
- * Scan app/ (Next.js App Router conventions):
+ * Scan app/ (App Router conventions):
  *   page.* -> PAGE, route.* -> API (named exports GET/POST/...), layout.* wraps everything below it, template.* is a layout that remounts when the next URL segment changes,
  *   not-found.* / loading.* / error.* (nearest wins), (group) folders, [id], [...slug], _private folders,
  *   @slot folders (parallel routes: page.* + default.*, rendered as a prop of the layout next to them) and (.)name / (..)name / (...)name folders inside a @slot (intercepting routes).
@@ -106,6 +111,7 @@ export function scanApp(root) {
   const templatesByDir = new Map(); // template.*: like a layout, but remounted when the next URL segment changes
   const notFounds = new Map(); // not-found.* may exist at any level (nearest one wins)
   const loadings = new Map(); // loading.*: shown during client-side navigation
+  const globalErrors = new Map(); // global-error.* (root only): replaces the whole page when the root layout or error.* itself fails
   const errors = new Map(); // error.* may exist at any level (nearest one wins, inside its own layouts)
   const statusPages = {}; // app/<status>.* (root only): 401.jsx, 403.jsx, 429.jsx, 503.jsx ... rendered inside the root layout
   const entries = [];
@@ -140,6 +146,7 @@ export function scanApp(root) {
     else if (stem === "not-found") single(notFounds, dir, file, "not-found files");
     else if (stem === "loading") single(loadings, dir, file, "loading files");
     else if (stem === "error") single(errors, dir, file, "error files");
+    else if (stem === "global-error" && dir === "") single(globalErrors, dir, file, "global-error files");
     else if (dir === "" && /^[45]\d\d$/.test(stem)) {
       const code = Number(stem);
       if (code === 404) throw new NepxError(`${file}: use not-found.* for the 404 page`);
@@ -152,6 +159,7 @@ export function scanApp(root) {
   }
   const notFound = notFounds.get("") ?? null;
   const errorPage = errors.get("") ?? null;
+  const globalError = globalErrors.get("") ?? null;
   // template depth = number of URL segments above it: the template remounts when URL segment number `depth` changes
   const templates = {};
   for (const [d, f] of templatesByDir) {
@@ -240,7 +248,7 @@ export function scanApp(root) {
   }
   routes.sort(compareRoutes);
   const slots = [...slotMap.values()].map(({ key, dir, name, layout, routes: r, intercepts, default: d }) => ({ key, dir, name, layout, routes: r, intercepts, default: d }));
-  return { routes, rootLayout: layouts.get("") ?? null, notFound, errorPage, statusPages, templates, slots };
+  return mergePages(root, { routes, rootLayout: layouts.get("") ?? null, notFound, errorPage, globalError, statusPages, templates, slots }, { walk, splitExt, parseDirSegments, urlPathOf, compareRoutes });
 }
 
 export const scanPages = (root) => scanApp(root).routes.filter((r) => r.type === "PAGE");
@@ -248,9 +256,11 @@ export const scanApi = (root) => scanApp(root).routes.filter((r) => r.type === "
 
 /** Locate middleware.* next to app/ (or in src/). */
 export function findMiddleware(root) {
-  for (const ext of EXTS) {
-    const rel = path.posix.join(baseDir(root), "middleware" + ext);
-    if (existsSync(path.join(root, rel))) return rel;
+  for (const name of ["middleware", "proxy"]) { // proxy.* is an alias of middleware.*
+    for (const ext of EXTS) {
+      const rel = path.posix.join(baseDir(root), name + ext);
+      if (existsSync(path.join(root, rel))) return rel;
+    }
   }
   return null;
 }
@@ -264,6 +274,15 @@ export function findInstrumentation(root) {
   return null;
 }
 
+/** Locate instrumentation-client.* next to app/ (or in src/): it runs in the browser before the app hydrates. */
+export function findInstrumentationClient(root) {
+  for (const ext of EXTS) {
+    const rel = path.posix.join(baseDir(root), "instrumentation-client" + ext);
+    if (existsSync(path.join(root, rel))) return rel;
+  }
+  return null;
+}
+
 const DYNAMIC_MODES = ["auto", "force-dynamic", "force-static"];
 
 /** Import every route module once to learn methods / data functions, and to surface compile errors early. */
@@ -271,7 +290,7 @@ export async function inspectRoutes(root, scan, { concurrency = 1 } = {}) {
   const load = (file) => import(pathToFileURL(path.join(root, file)).href);
   const layoutErr = new Map();
   const special = (r) => [r.notFound?.file, r.loading?.file, r.errorScope?.file].filter(Boolean);
-  const sharedFiles = new Set([...scan.routes.flatMap((r) => [...r.layouts, ...special(r)]), ...(scan.rootLayout ? [scan.rootLayout] : []), ...(scan.notFound ? [scan.notFound] : []), ...(scan.errorPage ? [scan.errorPage] : []), ...Object.values(scan.statusPages ?? {})]);
+  const sharedFiles = new Set([...scan.routes.flatMap((r) => [...r.layouts, ...special(r)]), ...(scan.rootLayout ? [scan.rootLayout] : []), ...(scan.notFound ? [scan.notFound] : []), ...(scan.errorPage ? [scan.errorPage] : []), ...(scan.globalError ? [scan.globalError] : []), ...Object.values(scan.statusPages ?? {})]);
   await pool(sharedFiles, concurrency, async (f) => { // turbo: concurrency > 1 imports these in parallel
     try {
       const m = await load(f);
@@ -290,7 +309,18 @@ export async function inspectRoutes(root, scan, { concurrency = 1 } = {}) {
       } else {
         if (typeof mod.default !== "function") entry.error = `${r.file}: must default-export a React component`;
         entry.hasData = typeof mod.getServerSideProps === "function";
-        entry.staticParams = typeof mod.generateStaticParams === "function";
+        const gip = typeof mod.default?.getInitialProps === "function" || (r.pagesApp && isCustomAppGip((await load(r.pagesApp)).default?.getInitialProps)); // Pages-Router getInitialProps (page or _app): runs on the server, props delivered like getServerSideProps
+        if (gip) {
+          if (entry.hasData || typeof mod.getStaticProps === "function") entry.error = `${r.file}: getInitialProps cannot be combined with getServerSideProps / getStaticProps`;
+          else { entry.hasData = true; entry.initialProps = true; }
+        }
+        entry.staticPaths = typeof mod.getStaticPaths === "function";
+        entry.staticParams = typeof mod.generateStaticParams === "function" || entry.staticPaths;
+        if (typeof mod.getStaticProps === "function") { // Pages-Router style: prerendered like a static page, props delivered like getServerSideProps
+          if (entry.hasData) entry.error = `${r.file}: a page cannot export both getStaticProps and getServerSideProps`;
+          else { entry.hasData = true; entry.staticProps = true; }
+        }
+        if (!entry.error && entry.staticPaths && !entry.staticProps && typeof mod.generateStaticParams !== "function") entry.error = `${r.file}: getStaticPaths needs getStaticProps (or use generateStaticParams)`;
         if (mod.dynamic !== undefined && !DYNAMIC_MODES.includes(mod.dynamic)) entry.error = `${r.file}: dynamic must be "auto", "force-dynamic" or "force-static"`;
         else if (mod.dynamic && mod.dynamic !== "auto") entry.dynamic = mod.dynamic;
         if (mod.dynamicParams !== undefined) {
@@ -306,7 +336,7 @@ export async function inspectRoutes(root, scan, { concurrency = 1 } = {}) {
         }
         if (mod.revalidate !== undefined) {
           if (mod.revalidate !== false && !(Number.isFinite(mod.revalidate) && mod.revalidate > 0)) entry.error = `${r.file}: revalidate must be a positive number of seconds (or false)`;
-          else if (mod.revalidate !== false && entry.hasData) entry.error = `${r.file}: a page cannot export both revalidate and getServerSideProps`;
+          else if (mod.revalidate !== false && entry.hasData && !entry.staticProps) entry.error = `${r.file}: a page cannot export both revalidate and getServerSideProps`;
           else if (mod.revalidate !== false && entry.dynamic === "force-dynamic") entry.error = `${r.file}: a force-dynamic page cannot export revalidate (it is never cached)`;
           else if (mod.revalidate !== false) entry.revalidate = mod.revalidate;
         }
@@ -326,7 +356,8 @@ export async function inspectRoutes(root, scan, { concurrency = 1 } = {}) {
         const m = await load(file);
         if (typeof m.default !== "function") return `${file}: must default-export a React component`;
         if (typeof m.getServerSideProps === "function") return `${file}: getServerSideProps is not supported in @${sl.name} slot pages (load data in the parent page or in the component)`;
-        if (typeof m.generateStaticParams === "function") return `${file}: generateStaticParams is not supported in @${sl.name} slot pages`;
+        if (typeof m.generateStaticParams === "function" || typeof m.getStaticPaths === "function") return `${file}: generateStaticParams / getStaticPaths is not supported in @${sl.name} slot pages`;
+        if (typeof m.getStaticProps === "function") return `${file}: getStaticProps is not supported in @${sl.name} slot pages (load data in the parent page or in the component)`;
       } catch (err) { return `${file}: ${err.message.split("\n")[0]}`; }
       return null;
     };
@@ -336,8 +367,9 @@ export async function inspectRoutes(root, scan, { concurrency = 1 } = {}) {
   if (scan.rootLayout && layoutErr.has(scan.rootLayout)) extra.push(layoutErr.get(scan.rootLayout));
   if (scan.notFound && layoutErr.has(scan.notFound)) extra.push(layoutErr.get(scan.notFound));
   if (scan.errorPage && layoutErr.has(scan.errorPage)) extra.push(layoutErr.get(scan.errorPage));
+  if (scan.globalError && layoutErr.has(scan.globalError)) extra.push(layoutErr.get(scan.globalError));
   for (const f of Object.values(scan.statusPages ?? {})) if (layoutErr.has(f)) extra.push(layoutErr.get(f));
-  return { routes: out, rootLayout: scan.rootLayout, notFound: scan.notFound, errorPage: scan.errorPage, statusPages: scan.statusPages ?? {}, templates: scan.templates ?? {}, slots, extraErrors: extra };
+  return { routes: out, rootLayout: scan.rootLayout, notFound: scan.notFound, errorPage: scan.errorPage, globalError: scan.globalError, statusPages: scan.statusPages ?? {}, templates: scan.templates ?? {}, slots, extraErrors: extra };
 }
 
 export { matchRoute } from "./match.js";

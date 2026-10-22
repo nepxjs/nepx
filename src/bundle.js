@@ -4,10 +4,10 @@ import path from "node:path";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { NepxError } from "./errors/index.js";
-import { baseDir, EXTS } from "./router.js";
+import { baseDir, EXTS, findInstrumentationClient } from "./router.js";
 import { stripServerExports } from "./strip.js";
 import { publicEnv } from "./env.js";
-import { ASSET_EXT, assetUrl } from "./assets.js";
+import { ASSET_EXT, assetUrl, assetBase } from "./assets.js";
 import { cssModule } from "./cssmodules.js";
 import { MIME } from "./mime.js";
 import { buildPayload } from "./overlay.js";
@@ -22,8 +22,8 @@ function resolveFromProject(root, id) {
   catch { throw new NepxError(`Cannot find "${id}" in ${root}. Run "npm install react react-dom" in your project.`); }
 }
 
-function entrySource(root, scan) {
-  const { pages, rootLayout, notFound, errorPage, templates = {}, slots = [] } = scan;
+function entrySource(root, scan, { strictMode = false } = {}) {
+  const { pages, rootLayout, notFound, errorPage, globalError, templates = {}, slots = [] } = scan;
   const imports = new Map(); // file -> identifier
   const imp = (file) => { if (!imports.has(file)) imports.set(file, `M${imports.size}`); return imports.get(file); };
   const wrappers = []; // a template is a layout module that also carries the URL depth that decides when it remounts
@@ -39,8 +39,11 @@ function entrySource(root, scan) {
   const rl = rootLayout ? imp(rootLayout) : "undefined";
   const nf = notFound ? imp(notFound) : "undefined";
   const ep = errorPage ? imp(errorPage) : "undefined";
+  const ge = globalError ? imp(globalError) : "undefined";
   const lines = [`import { mountNepx } from "nepx";`];
-  const body = `mountNepx({ routes: [\n  ${table.join(",\n  ")}\n], slotTable: { ${slotTable.join(", ")} }, rootLayout: ${rl}, NotFound: ${nf} && ${nf}.default, ErrorPage: ${ep} && ${ep}.default });`;
+  const ic = findInstrumentationClient(root); // runs before any page module (ES imports evaluate in order); onRouterTransitionStart() is told about client-side navigations
+  if (ic) lines.push(`import * as IC from ${abs(ic)};`, `if (typeof IC.onRouterTransitionStart === "function") globalThis.__NEPX_ROUTER_TRANSITION_START__ = IC.onRouterTransitionStart;`);
+  const body = `mountNepx({ strictMode: ${strictMode ? "true" : "false"}, routes: [\n  ${table.join(",\n  ")}\n], slotTable: { ${slotTable.join(", ")} }, rootLayout: ${rl}, NotFound: ${nf} && ${nf}.default, ErrorPage: ${ep} && ${ep}.default, GlobalError: ${ge} && ${ge}.default });`;
   for (const [file, id] of imports) lines.push(`import * as ${id} from ${abs(file)};`);
   lines.push(...wrappers, body);
   return lines.join("\n");
@@ -49,11 +52,19 @@ function entrySource(root, scan) {
 export function formatBuildError(err) {
   const msgs = err.errors ?? [];
   if (!msgs.length) return err.message;
-  return msgs.map((m) => (m.location ? `${m.location.file}:${m.location.line}:${m.location.column + 1}: ${m.text}` : m.text)).join("\n");
+  return msgs.map((m) => (m.location ? `${String(m.location.file).split(path.sep).join("/")}:${m.location.line}:${m.location.column + 1}: ${m.text}` : m.text)).join("\n");
 }
 
 /** Bundle all pages into client.js (+ client.css). Returns Map<urlPath,{body,type}>. Throws NepxError on failure. */
-export async function bundleClient(root, scan, { dev = false, basePath = "" } = {}) {
+/** compiler.removeConsole -> esbuild options: `true` drops every console.* call, `{ exclude: [...] }` keeps those methods. Production builds only. */
+export function consoleOptions(removeConsole) {
+  if (!removeConsole) return {};
+  if (removeConsole === true || !Array.isArray(removeConsole.exclude) || !removeConsole.exclude.length) return { drop: ["console"] };
+  const all = ["log", "info", "debug", "trace", "table", "dir", "dirxml", "group", "groupCollapsed", "groupEnd", "time", "timeEnd", "timeLog", "count", "countReset", "assert", "warn", "error"];
+  return { pure: all.filter((m) => !removeConsole.exclude.includes(m)).map((m) => `console.${m}`) };
+}
+
+export async function bundleClient(root, scan, { dev = false, basePath = "", strictMode = false, removeConsole = false } = {}) {
   let esbuild;
   try { esbuild = await import("esbuild"); } catch { throw new NepxError('esbuild is required to build pages. Run "npm install".'); }
   const { pages } = scan;
@@ -80,7 +91,7 @@ export async function bundleClient(root, scan, { dev = false, basePath = "" } = 
         return r.errors.length ? r : { path: r.path, namespace: "nepx-asset" };
       });
       b.onLoad({ filter: /.*/, namespace: "nepx-asset" }, (args) => {
-        const body = readFileSync(args.path), url = assetUrl(args.path, body, basePath);
+        const body = readFileSync(args.path), url = assetUrl(args.path, body, assetBase(basePath));
         media.set(url, { body, type: typeOf(args.path) });
         return { contents: `export default ${JSON.stringify(url)};`, loader: "js" };
       });
@@ -124,16 +135,16 @@ export async function bundleClient(root, scan, { dev = false, basePath = "" } = 
   let result;
   try {
     result = await esbuild.build({
-      stdin: { contents: entrySource(root, scan), resolveDir: root, sourcefile: "nepx-entry.js", loader: "js" },
+      stdin: { contents: entrySource(root, scan, { strictMode }), resolveDir: root, sourcefile: "nepx-entry.js", loader: "js" },
       bundle: true, write: false, outdir: path.join(root, ".nepx-out"), entryNames: "client", chunkNames: "chunk.[hash]", splitting: true, format: "esm", target: "es2020", // dynamic() imports become their own chunks
-      jsx: "automatic", alias, define, minify: !dev, sourcemap: dev ? "inline" : false, logLevel: "silent", plugins: [plugin],
+      jsx: "automatic", alias, define, minify: !dev, sourcemap: dev ? "inline" : false, logLevel: "silent", plugins: [plugin], ...(dev ? {} : consoleOptions(removeConsole)),
       resolveExtensions: [".tsx", ".ts", ".jsx", ".ksx", ".js", ".css", ".json"],
-      loader: { ".ksx": "jsx", ...MEDIA_LOADERS }, assetNames: "m-[name].[hash]", publicPath: basePath + "/_nepx",
+      loader: { ".ksx": "jsx", ...MEDIA_LOADERS }, assetNames: "m-[name].[hash]", publicPath: assetBase(basePath) + "/_nepx",
     });
   } catch (err) {
     const e = new NepxError(`Client build failed:\n${formatBuildError(err)}`);
     // structured locations: the dev overlay shows a code frame for each one (column is 1-based)
-    e.details = (err.errors ?? []).map((m) => ({ text: m.text, file: m.location?.file, line: m.location?.line, column: m.location ? m.location.column + 1 : undefined }));
+    e.details = (err.errors ?? []).map((m) => ({ text: m.text, file: m.location?.file ? String(m.location.file).split(path.sep).join("/") : undefined, line: m.location?.line, column: m.location ? m.location.column + 1 : undefined }));
     throw e;
   }
   const assets = new Map(media);

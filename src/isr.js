@@ -32,7 +32,8 @@ export class IsrCache {
   lookup(key, seconds, now = Date.now()) {
     const e = this.entries.get(key);
     if (!e) return null;
-    return { entry: e, stale: now - e.at >= seconds * 1000 };
+    const s = e.seconds ?? seconds; // an entry can carry its own interval (getStaticProps -> { revalidate })
+    return { entry: e, stale: Number.isFinite(s) && now - e.at >= s * 1000 };
   }
   refresh(key, produce) {
     if (this.inflight.has(key)) return this.inflight.get(key);

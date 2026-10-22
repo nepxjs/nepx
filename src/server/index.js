@@ -1,3 +1,4 @@
+import { patchFetch } from "../fetch-cache.js";
 import http from "node:http";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -8,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { HttpError, isHttpError, publicMessage } from "../errors/index.js";
 import { resolveSecurity, createSecurity, parseCspReport, wantsHtml, CSP_REPORT_PATH } from "../security/index.js";
 import { matchRoute } from "../match.js";
-import { scanIcons } from "../appicons.js";
+import { scanIcons, isDynamicIcon, imageVariants } from "../appicons.js";
 import { appDirOf } from "../router.js";
 import { createParamsGate } from "../dynamic-params.js";
 import { createRenderer, renderDocument, documentParts, assetRefs } from "../ssr.js";
@@ -17,10 +18,12 @@ import { buildCsp } from "../security/csp.js";
 import { withBase } from "../base.js";
 import { als, newStore, isDraftRequest } from "../request-context.js";
 import { IsrCache } from "../isr.js";
-import { metaResponse } from "../metaroutes.js";
+import { metaResponse, sitemapResponse } from "../metaroutes.js";
+import { createImageOptimizer, imageContext } from "../images.js";
+import { splitLocale, pickLocale, LOCALE_COOKIE } from "../i18n.js";
 import { isNotFoundError, isDynamicError } from "../shared.js";
 import { buildPayload, errorPageHtml, resolveBrowserError, terminalFrame } from "../overlay.js";
-import { MIME, parseCookies, readBody, decodeSegments, jsonResponse, htmlResponse } from "./http-utils.js";
+import { MIME, parseCookies, readBody, decodeSegments, jsonResponse, htmlResponse, conditionalResponse } from "./http-utils.js";
 import { createCompressor } from "./compression.js";
 import { createPublicFiles } from "./static-files.js";
 import { createErrorResponder } from "./error-response.js";
@@ -32,7 +35,8 @@ import { handleParserErrors } from "./parser-errors.js";
  *  rootLayout/notFound: files for the 404 view; middleware: {fn, matches}; assets: Map "/_nepx/..." -> {body,type};
  *  publicDir: static files served at "/"; staticDir: prerendered pages (nepx build).
  */
-export function createNepxServer({ root, projectRoot = root, routes, maxBodySize, dev = false, publicDir = null, staticDir = null, assets = new Map(), middleware = null, rootLayout = null, notFound = null, errorPage = null, redirects = [], rewrites = [], headerRules = [], trailingSlash = false, compress = true, log = dev, statusPages = {}, security = null, basePath = "", templates = {}, slots = [], streaming = true, instrumentation = null }) {
+export function createNepxServer({ root, projectRoot = root, routes, maxBodySize, dev = false, publicDir = null, staticDir = null, assets = new Map(), middleware = null, rootLayout = null, notFound = null, errorPage = null, globalError = null, redirects = [], rewrites = [], headerRules = [], trailingSlash = false, compress = true, log = dev, statusPages = {}, security = null, basePath = "", templates = {}, slots = [], streaming = true, instrumentation = null, images = null, i18n = null, poweredByHeader = false, fallbackRewrites = [] }) {
+  patchFetch(); // fetch(url, { cache, nepx: { revalidate, tags } })
   const sec = resolveSecurity(security ?? {});
   const guard = createSecurity(sec, { dev });
   const modules = new Map();
@@ -40,7 +44,8 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
   const dynamicPages = new Set(); // revalidate pages that turned out to read cookies()/headers(): never cached
   const pageRoutes = routes.filter((r) => r.type === "PAGE");
   const hasPages = pageRoutes.length > 0 || !!notFound || !!errorPage || Object.keys(statusPages).length > 0;
-  const renderer = hasPages ? createRenderer({ projectRoot, root, rootLayout, notFound, errorPage, statusPages, templates, slots, basePath }) : null;
+  const renderer = hasPages ? createRenderer({ projectRoot, root, rootLayout, notFound, errorPage, globalError, statusPages, templates, slots, basePath, images: imageContext(images), i18n }) : null;
+  const serveImage = images && images.optimize ? createImageOptimizer({ publicDir, config: images, projectRoot, dev }) : null;
   const refs = assetRefs(assets);
   const iconFiles = scanIcons(appDirOf(root));
   const paramsGate = createParamsGate((file) => renderer.load(file));
@@ -115,7 +120,14 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
       if (!body || body.length === 0) throw new HttpError(400, "Request body is empty");
       try { return JSON.parse(body.toString("utf8")); } catch { throw new HttpError(400, "Invalid JSON body"); }
     };
+    const cookieMap = parseCookies(headers.get("cookie"));
+    Object.defineProperties(request, { // Request conveniences
+      nepxUrl: { value: url, enumerable: true },
+      nextUrl: { value: url, enumerable: true }, // legacy name
+      cookies: { value: { get: (n) => (Object.hasOwn(cookieMap, n) ? { name: n, value: cookieMap[n] } : undefined), getAll: () => Object.entries(cookieMap).map(([name, value]) => ({ name, value })), has: (n) => Object.hasOwn(cookieMap, n) }, enumerable: true },
+    });
     const mod = await loadModule(route);
+    if (route.meta === "sitemap") { const sm = await sitemapResponse(mod, { base: url.origin + basePath }); if (sm) return sm; } // generateSitemaps: /sitemap.xml is the index
     if (route.meta) return metaResponse(route.meta, () => mod.default());
     let result;
     try { result = await mod[method](request, { params, url, cookies: parseCookies(headers.get("cookie")), requestId: req.requestId }); }
@@ -150,8 +162,8 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
     }
     if (view.redirect) return { redirect: view.redirect };
     const boot = resolvedPath && resolvedPath !== url.pathname ? { ...view.boot, resolved: resolvedPath } : view.boot;
-    if (view.stream) return { status: view.status, stream: view.stream, parts: documentParts({ metadata: view.metadata, boot, refs, dev, devError, basePath, stream: true }) };
-    return { status: view.status, html: renderDocument({ html: view.html, metadata: view.metadata, boot, refs, dev, devError, basePath }) };
+    if (view.stream) return { status: view.status, stream: view.stream, parts: documentParts({ metadata: view.metadata, boot, refs, dev, devError, basePath, stream: true, headExtra: view.headHtml }) };
+    return { status: view.status, html: renderDocument({ html: view.html, metadata: view.metadata, boot, refs, dev, devError, basePath, headExtra: view.headHtml }) };
   }
 
   /** The page as it is written: head, then React's stream (shell now, Suspense boundaries as they finish), then the tail. */
@@ -179,7 +191,7 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
 
   /** Pages with `export const revalidate = N`: served from memory, regenerated in the background when stale. */
   async function renderRevalidated(req, url, found, resolvedPath, segments) {
-    const seconds = found.route.revalidate;
+    const seconds = found.route.revalidate ?? 31_536_000; // getStaticProps without revalidate: kept until revalidatePath / revalidateTag
     const key = "/" + segments.join("/");
     if (staticDir && !isr.get(key) && !isr.isStaticSkipped(key) && !isr.isTagSkipped(found.route.tags)) {
       try { // seed from the page prerendered at build time
@@ -193,33 +205,34 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
       const store = als.getStore();
       const r = await produce({ ...req, method: "GET", headers: {}, requestId: req.requestId }, u, found, resolvedPath);
       if (r.redirect || r.status !== 200 || store.dynamic) { isr.entries.delete(key); return null; }
-      const entry = { html: Buffer.from(r.html), at: Date.now(), tags: [...new Set([...(found.route.tags ?? []), ...store.tags])] };
+      const entry = { html: Buffer.from(r.html), at: Date.now(), seconds: store.revalidateHint, tags: [...new Set([...(found.route.tags ?? []), ...store.tags])] };
       isr.set(key, entry);
       return entry;
     }));
     if (hit) {
       if (hit.stale) regenerate().catch((e) => console.error(`[${req.requestId}] revalidate ${key} failed:`, e && e.message));
-      return isrResponse(hit.entry, hit.stale ? "STALE" : "HIT", seconds);
+      return isrResponse(hit.entry, hit.stale ? "STALE" : "HIT", hit.entry.seconds ?? seconds);
     }
     const store = als.getStore();
     const r = await produce(req, u, found, resolvedPath);
     if (r.redirect) return redirectResponse(r.redirect);
     if (r.status !== 200) return htmlResponse(r.status, r.html, { "cache-control": "no-store", ...r.headers });
     if (store && store.dynamic) { dynamicPages.add(found.route.file); return htmlResponse(200, r.html); }
-    const entry = { html: Buffer.from(r.html), at: Date.now(), tags: [...new Set([...(found.route.tags ?? []), ...(store?.tags ?? [])])] };
+    const entry = { html: Buffer.from(r.html), at: Date.now(), seconds: store?.revalidateHint, tags: [...new Set([...(found.route.tags ?? []), ...(store?.tags ?? [])])] };
     isr.set(key, entry);
-    return isrResponse(entry, "MISS", seconds);
+    return isrResponse(entry, "MISS", entry.seconds ?? seconds);
   }
 
   /** -> null (no middleware / continue) | { response } | { rewrite, headers } | { headers } */
   async function runMiddleware(req, url) {
     if (!middleware || !middleware.matches(url.pathname)) return null;
     const { request, headers } = toRequest(req, url, { reqHeaders: undefined });
-    const r = await middleware.fn(request, { url, cookies: parseCookies(headers.get("cookie")), requestId: req.requestId });
+    const event = { waitUntil: (p) => { Promise.resolve(p).catch((e) => console.error(`[${req.requestId}] middleware waitUntil() failed:`, e && e.stack ? e.stack : e)); } };
+    const r = await middleware.fn(request, { url, cookies: parseCookies(headers.get("cookie")), requestId: req.requestId, waitUntil: event.waitUntil });
     if (r === undefined || r === null) return null;
     if (!(r instanceof Response)) throw new TypeError(`${middleware.file}: middleware must return a Response or nothing`);
     const rw = r.headers.get("x-nepx-rewrite");
-    const cont = rw || r.headers.get("x-nepx-next");
+    const cont = rw || r.headers.get("x-nepx-continue");
     if (!cont) return { response: r };
     const extra = {};
     for (const [k, v] of r.headers) if (!k.startsWith("x-nepx-")) extra[k] = v;
@@ -239,11 +252,18 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
 
   /** GET /_nepx/data?path=/x?y=1 -> JSON for client-side navigation (middleware, rewrites, getServerSideProps, metadata). */
   async function handleData(req, url) {
-    const target = url.searchParams.get("path") ?? "";
+    let target = url.searchParams.get("path") ?? "";
     if (!target.startsWith("/") || target.startsWith("//")) throw new HttpError(400, "Invalid path");
     let tUrl;
     try { tUrl = new URL(target, url.origin); } catch { throw new HttpError(400, "Invalid path"); }
     if (tUrl.origin !== url.origin) throw new HttpError(400, "Invalid path");
+    if (i18n) { // the browser sends the address-bar path (/id/about): same locale handling as a page request
+      const sp = splitLocale(tUrl.pathname, i18n);
+      if (sp.locale) { tUrl = new URL(tUrl); tUrl.pathname = sp.pathname; }
+      const st0 = als.getStore();
+      if (st0) st0.locale = sp.locale ?? i18n.defaultLocale;
+      target = tUrl.pathname + tUrl.search;
+    }
     const noStore = { "cache-control": "no-store" };
     const mw = await runMiddleware({ method: "GET", url: target, headers: req.headers, requestId: req.requestId }, tUrl);
     let rUrl = tUrl;
@@ -339,6 +359,22 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
   }
 
   async function route(req, url, headers, ip) {
+    let locale = null;
+    if (i18n && !url.pathname.startsWith("/_nepx")) { // config.i18n: /id/about is /about in Indonesian; the default locale has no prefix
+      const sp = splitLocale(url.pathname, i18n), read = req.method === "GET" || req.method === "HEAD";
+      if (sp.locale === i18n.defaultLocale && read) return new Response(null, { status: 308, headers: { location: sp.pathname + url.search } });
+      if (sp.locale) { const u = new URL(url); u.pathname = sp.pathname; url = u; locale = sp.locale; }
+      else {
+        locale = i18n.defaultLocale;
+        if (read && url.pathname === "/" && i18n.detection && /text\/html/.test(String(req.headers.accept ?? ""))) { // first visit: the cookie, else the browser's language
+          const c = parseCookies(req.headers.cookie)[LOCALE_COOKIE];
+          const want = i18n.locales.includes(c) ? c : pickLocale(req.headers["accept-language"], i18n);
+          if (want && want !== i18n.defaultLocale) return new Response(null, { status: 307, headers: { location: "/" + want + url.search, vary: "Accept-Language, Cookie" } });
+        }
+      }
+      const st0 = als.getStore();
+      if (st0) st0.locale = locale;
+    }
     let segments = decodeSegments(url.pathname);
     const isRead = req.method === "GET" || req.method === "HEAD";
     const rctx = ctxOf(req, url);
@@ -355,6 +391,7 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
     }
     if (segments[0] === "_nepx") {
       if (segments[1] === "data" && segments.length === 2 && renderer && isRead) return handleData(req, url);
+      if (segments[1] === "image" && segments.length === 2 && isRead && serveImage) return serveImage(url, req);
       if (segments[1] === "action" && segments.length === 2 && req.method === "POST") return handleAction(req);
       if (segments[1] === "func" && segments.length === 2 && isRead && req.method === "GET") return handleFunc(req, url);
       if (sec.cspReport === true && url.pathname === CSP_REPORT_PATH && req.method === "POST") return handleCspReport(req, ip);
@@ -362,7 +399,7 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
       const asset = isRead ? assets.get("/" + segments.join("/")) : null;
       if (!asset) throw new HttpError(404, "Not found");
       const hashed = !dev && /^\/_nepx\/[\w-]+\.[0-9a-zA-Z]{8}\.\w+$/.test(url.pathname);
-      return new Response(req.method === "HEAD" ? null : asset.body, { headers: { "content-type": asset.type, "cache-control": hashed ? "public, max-age=31536000, immutable" : "no-cache" } });
+      return conditionalResponse(req, asset.body, { "content-type": asset.type, "cache-control": hashed ? "public, max-age=31536000, immutable" : "no-cache" });
     }
     const mw = await runMiddleware(req, url);
     if (mw && mw.response) return mw.response;
@@ -378,6 +415,13 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
     if (found && !(await paramsGate(found.route, found.params))) found = null; // dynamicParams = false: unknown params are a 404
     if (found) req.nepxRoute = { path: found.route.path, type: found.route.type === "API" ? "route" : "render" };
     if (found && found.route.type === "API") return handleApi(req, url, found);
+    if (!found && isRead && segments.length === 2 && segments[0] === "sitemap" && /^[A-Za-z0-9_-]+\.xml$/.test(segments[1])) { // generateSitemaps: /sitemap/<id>.xml
+      const smRoute = routes.find((r) => r.meta === "sitemap");
+      if (smRoute) {
+        const sm = await sitemapResponse(await loadModule(smRoute), { base: url.origin + basePath, id: segments[1].slice(0, -4) });
+        if (sm) return sm;
+      }
+    }
     if (found) {
       if (!isRead) return jsonResponse(405, { error: "Method not allowed" }, { allow: "GET, HEAD" });
       const st = als.getStore();
@@ -386,19 +430,51 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
         res.headers.set("cache-control", "private, no-store");
         return res;
       }
-      if (found.route.revalidate && !dynamicPages.has(found.route.file)) return renderRevalidated(req, url, found, resolvedPath, segments);
-      if (staticDir && found.route.ssg) {
+      if ((found.route.revalidate || found.route.staticProps) && !dynamicPages.has(found.route.file) && (!i18n || locale === i18n.defaultLocale)) return renderRevalidated(req, url, found, resolvedPath, segments);
+      if (staticDir && found.route.ssg && (!i18n || locale === i18n.defaultLocale)) { // prerendered pages are in the default locale
         try { return htmlResponse(200, await readFile(path.join(staticDir, ...segments, "index.html"))); } catch { /* not prerendered: render on demand */ }
       }
       return renderPage(req, url, found, resolvedPath);
     }
     if (!isRead || segments[0] === "api") throw new HttpError(404, "Not found");
+    if (segments.length === 2 && iconFiles.has(segments[0]) && isDynamicIcon(iconFiles.get(segments[0]))) { // generateImageMetadata(): /icon/<id>
+      const abs = iconFiles.get(segments[0]);
+      const variant = (await imageVariants(abs)).find((v) => v.id === segments[1]);
+      if (!variant) throw new HttpError(404, "Not found");
+      const mod = await import(pathToFileURL(abs).href);
+      const out = await mod.default({ params: {}, id: variant.id });
+      if (!(out instanceof Response)) throw new Error(`${path.basename(abs)} must return an ImageResponse (or a Response)`);
+      return out;
+    }
     if (segments.length === 1 && iconFiles.has(segments[0])) { // app/icon.png etc.
       const abs = iconFiles.get(segments[0]);
-      return new Response(req.method === "HEAD" ? null : await readFile(abs), { headers: { "content-type": MIME[path.extname(abs).toLowerCase()] ?? "application/octet-stream", "cache-control": dev ? "no-cache" : "public, max-age=3600" } });
+      if (isDynamicIcon(abs)) { // app/opengraph-image.jsx: the default export returns an ImageResponse
+        const mod = await import(pathToFileURL(abs).href);
+        const gen = mod.default;
+        if (typeof gen !== "function") throw new Error(`${path.basename(abs)} must export a default function that returns an ImageResponse`);
+        const out = await gen({ params: {}, id: "default" });
+        if (!(out instanceof Response)) throw new Error(`${path.basename(abs)} must return an ImageResponse (or a Response)`);
+        return out;
+      }
+      return conditionalResponse(req, await readFile(abs), { "content-type": MIME[path.extname(abs).toLowerCase()] ?? "application/octet-stream", "cache-control": dev ? "no-cache" : "public, max-age=3600" });
     }
-    const pub = await servePublic(segments, req.method);
+    const pub = await servePublic(segments, req);
     if (pub) return pub;
+    if (fallbackRewrites.length && target === url) { // rewrites.fallback: only when no page, API route or public file matched
+      const fctx = ctxOf(req, url);
+      for (const rule of fallbackRewrites) {
+        const dest = rule.resolve(url.pathname, url.search, fctx);
+        if (!dest) continue;
+        const fb = new URL(dest, url.origin);
+        if (isExternal(fb, url)) return proxy(req, url, fb);
+        const fsegs = decodeSegments(fb.pathname);
+        const f2 = matchRoute(routes, fsegs);
+        if (f2 && (await paramsGate(f2.route, f2.params))) return f2.route.type === "API" ? handleApi(req, url, f2) : renderPage(req, url, f2, fb.pathname);
+        const pub2 = await servePublic(fsegs, req);
+        if (pub2) return pub2;
+        break; // the first matching rule decides
+      }
+    }
     if (guard.isProbe?.(url.pathname)) { guard.emit("probe", req, { status: 404, ip }); return new Response("Not found", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } }); }
     if (!hasPages) throw new HttpError(404, "Not found");
     return renderPage(req, url, null, resolvedPath);
@@ -407,7 +483,7 @@ export function createNepxServer({ root, projectRoot = root, routes, maxBodySize
   async function handle(req) {
     const requestId = guard.requestId(req) ?? crypto.randomUUID();
     req.requestId = requestId;
-    let headers = { "x-request-id": requestId, "x-content-type-options": "nosniff" };
+    let headers = { "x-request-id": requestId, "x-content-type-options": "nosniff", ...(poweredByHeader ? { "x-powered-by": "Nepx" } : {}) };
     let response, url = null, store = null;
     try {
       if (!req.url || !req.url.startsWith("/")) throw new HttpError(400, "Bad request target");

@@ -61,7 +61,7 @@ export function exportedNames(src) {
 
 function* walkCode(dir) {
   for (const name of readdirSync(dir)) {
-    if (SKIP_DIRS.has(name) || name.startsWith(".")) continue;
+    if (SKIP_DIRS.has(name) || name === process.env.NEPX_DIST_DIR || name.startsWith(".")) continue;
     const abs = path.join(dir, name);
     const st = lstatSync(abs);
     if (st.isSymbolicLink()) continue;

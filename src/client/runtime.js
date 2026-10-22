@@ -1,11 +1,13 @@
 // Browser runtime: hydration, client-side routing, data fetching for getServerSideProps pages,
 // loading.jsx while navigating, nested not-found / error boundaries, prefetching, soft refresh and <head> metadata updates.
-import { createElement as h, Component, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createElement as h, Component, StrictMode, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
+import { splitLocale } from "../i18n.js";
 import { matchRoute, matchSlot, matchIntercept, segmentsFor } from "../match.js";
-import { RouterContext, subscribe, getSnapshot, navigate, setRouterHooks, setClientBasePath, withBase } from "../link.js";
+import { setImageDefaults } from "../components.js";
+import { RouterContext, subscribe, getSnapshot, navigate, consumeScroll, setRouterHooks, setClientBasePath, setClientI18n, withBase } from "../link.js";
 import { metadataToTags } from "../metadata.js";
-import { isNotFoundError } from "../shared.js";
+import { isNotFoundError, queryObject } from "../shared.js";
 import { defaultNotFound } from "../views/not-found.js";
 
 const PREFETCH_TTL = 30_000;
@@ -69,26 +71,42 @@ class ErrorBoundary extends ResettingBoundary {
   }
 }
 
-export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLayout }) {
+// Outermost boundary (only when the project has global-error.*): whatever no error.* caught ends up here. notFound() is not an error.
+class GlobalErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  render() {
+    const { err } = this.state;
+    if (!err) return this.props.children;
+    if (isNotFoundError(err)) throw err;
+    return this.props.render(err, () => this.setState({ err: null }));
+  }
+}
+
+export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, GlobalError, rootLayout, strictMode = false }) {
   const rootEl = document.getElementById("root");
   let boot = null;
   try { boot = JSON.parse(document.getElementById("__NEPX_DATA__")?.textContent || "null"); } catch { /* ignore */ }
   const base = (boot && boot.basePath) || "";
   setClientBasePath(base);
+  setImageDefaults({ basePath: base, images: (boot && boot.images) || null }); // getImageProps() outside a component
+  const i18n = boot && boot.i18n ? { locales: boot.i18n.locales, defaultLocale: boot.i18n.defaultLocale, detection: true } : null; // config.i18n
+  setClientI18n(i18n);
+  const noLoc = (p) => (i18n ? splitLocale(p, i18n).pathname : p);
 
   // `resolved` is set when a rewrite serves another route's content at this URL.
   const resolve = (snap, resolved) => {
     const url = new URL(snap, location.origin);
-    const segs = toSegments(resolved || url.pathname);
+    const segs = toSegments(resolved || noLoc(url.pathname));
     const found = segs && matchRoute(routes, segs);
     return { url, found };
   };
 
-  // layouts wrap the element; the optional error boundary sits inside the layouts above error.jsx (like Next.js).
+  // layouts wrap the element; the optional error boundary sits inside the layouts above error.jsx.
   // `ex` (main page only): { segs, slotProps, loading } -> templates remount when URL segment `template` changes, slots arrive as props,
   // loading.jsx is a Suspense boundary (the same tree the server renders).
   const wrap = (el, layouts, params, snap, err, ex = {}) => {
-    const segs = ex.segs ?? toSegments(new URL(snap, location.origin).pathname) ?? [];
+    const segs = ex.segs ?? toSegments(noLoc(new URL(snap, location.origin).pathname)) ?? [];
     for (let i = layouts.length; i >= 0; i--) {
       if (ex.loading && i === ex.loading.layouts.length) el = h(Suspense, { fallback: h(ex.loading.mod.default) }, el);
       if (err && i === err.layouts.length) el = h(ErrorBoundary, { snap, Comp: err.Comp }, el);
@@ -109,7 +127,7 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
       if (intercept && intercept.key === s.key) { mod = intercept.mod; params = intercept.params; }
       else { const m = matchSlot(def, segs); if (m) { mod = m.route.mod; params = m.params; } else mod = def.default; }
       if (!mod) return null;
-      (out[s.layoutIndex] ??= {})[s.name] = h(mod.default, { params, searchParams: url.searchParams });
+      (out[s.layoutIndex] ??= {})[s.name] = h(mod.default, { params, searchParams: queryObject(url.searchParams) });
     }
     return out;
   };
@@ -117,7 +135,7 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
   const findIntercept = (mainSnap, resolved, snap) => {
     const cur = resolve(mainSnap, resolved).found;
     if (!cur || !cur.route.slots || !cur.route.slots.length) return null;
-    const segs = toSegments(new URL(snap, location.origin).pathname);
+    const segs = toSegments(noLoc(new URL(snap, location.origin).pathname));
     if (!segs) return null;
     for (const s of cur.route.slots) {
       const m = slotTable[s.key] && matchIntercept(slotTable[s.key], segs);
@@ -141,7 +159,8 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
 
   // ---- data for client-side navigation: prefetched copies live for 30s and are used once ----
   const prefetched = new Map(); // snap -> { at, promise }
-  const request = (snap) => fetch(base + "/_nepx/data?path=" + encodeURIComponent(snap)).then((r) => r.json());
+  // static export (nepx export): there is no server to ask, so every navigation is a normal page load
+  const request = (snap) => (boot && boot.static ? Promise.reject(new Error("static export")) : fetch(base + "/_nepx/data?path=" + encodeURIComponent(snap)).then((r) => r.json()));
   const takeData = (snap) => {
     const hit = prefetched.get(snap);
     prefetched.delete(snap);
@@ -205,7 +224,8 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
     useEffect(() => {
       if (first.current) { first.current = false; return; }
       if (view.intercept) return; // an intercepting page opens over the current one: keep the scroll position
-      if (!location.hash) window.scrollTo(0, 0);
+      const doScroll = consumeScroll(); // router.push(href, { scroll: false }) / <Link scroll={false}> keep the position
+      if (!location.hash && doScroll) window.scrollTo(0, 0);
       rootEl.focus({ preventScroll: true });
     }, [view.snap]);
     useEffect(() => {
@@ -213,7 +233,7 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
       applyMetadata(view.metadata);
     }, [view.metadata]);
 
-    const ctx = useMemo(() => ({ pathname: url.pathname, searchParams: url.searchParams, params: isNotFound || showError || !found ? {} : found.params, basePath: base }), [view.snap, isNotFound, showError]);
+    const ctx = useMemo(() => ({ pathname: noLoc(url.pathname), i18n: i18n ? { locale: splitLocale(url.pathname, i18n).locale ?? i18n.defaultLocale, locales: i18n.locales, defaultLocale: i18n.defaultLocale } : undefined, searchParams: url.searchParams, params: isNotFound || showError || !found ? {} : found.params, basePath: base, images: (boot && boot.images) || null }), [view.snap, isNotFound, showError]);
 
     // While the next page loads, show the nearest loading.jsx of the target route inside the layouts that stay mounted.
     const target = snap !== view.snap && !findIntercept(view.mainSnap ?? view.snap, view.resolved, snap) ? resolve(snap) : null;
@@ -223,7 +243,7 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
     if (loading) tree = wrap(h(loading.mod.default), loading.layouts, target.found.params, view.snap, null);
     else if (showError) tree = wrap(h(errScope.Comp, { error: view.error, reset: () => bump() }), errScope.layouts, found ? found.params : {}, view.snap, null);
     else if (isNotFound) tree = notFoundTree(found, view.snap);
-    else tree = wrap(h(found.route.page.default, { params: found.params, searchParams: url.searchParams, ...(view.props || {}) }), found.route.layouts, found.params, view.snap, errScope, { segs, slotProps, loading: found.route.loading });
+    else tree = wrap(h(found.route.page.default, { params: found.params, searchParams: queryObject(url.searchParams), ...(view.props || {}) }), found.route.layouts, found.params, view.snap, errScope, { segs, slotProps, loading: found.route.loading });
     return h(RouterContext.Provider, { value: ctx }, h(NotFoundBoundary, { snap: view.snap, fallback: () => notFoundTree(found, view.snap) }, tree));
   }
 
@@ -237,6 +257,12 @@ export function mountNepx({ routes, slotTable = {}, NotFound, ErrorPage, rootLay
       if (process.env.NODE_ENV !== "production" && window.__nepxOverlay) window.__nepxOverlay.report(err, { kind: "Runtime Error", handled: true, componentStack: info && info.componentStack });
     },
   };
-  if (rootEl.hasChildNodes()) hydrateRoot(rootEl, h(App), opts);
-  else createRoot(rootEl, opts).render(h(App));
+  // global-error.*: the server rendered it (boot.globalError), or an error escaped every error.* boundary in the browser.
+  const globalView = (err, reset) => h(GlobalError, { error: errorInfo(err), reset });
+  const tree = !GlobalError ? h(App)
+    : boot && boot.globalError ? h(GlobalError, { error: boot.error, reset: () => location.reload() })
+    : h(GlobalErrorBoundary, { render: globalView }, h(App));
+  const root = strictMode ? h(StrictMode, null, tree) : tree; // config.reactStrictMode
+  if (rootEl.hasChildNodes()) hydrateRoot(rootEl, root, opts);
+  else createRoot(rootEl, opts).render(root);
 }

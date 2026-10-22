@@ -85,13 +85,13 @@ export async function compileRules(cfg) {
     const base = compilePattern(r.source), when = compileConds(r.has, r.missing, `config.headers[${i}]`);
     return { match: (pathname, ctx) => !!base(pathname) && when(ctx), headers: list };
   });
-  const rewrites = (await resolveList(cfg.rewrites, "rewrites")).map((r, i) => {
-    if (!r || typeof r.source !== "string" || typeof r.destination !== "string") throw new NepxError(`config.rewrites[${i}] needs "source" and "destination" strings`);
+  const compileRewrite = (r, i, label) => {
+    if (!r || typeof r.source !== "string" || typeof r.destination !== "string") throw new NepxError(`${label}[${i}] needs "source" and "destination" strings`);
     const external = /^https?:\/\//i.test(r.destination);
     // external: "https://api.example.com/:path*" proxies the request. The origin must be literal (no :params) so a visitor can never choose the host.
-    if (external && !/^https?:\/\/[^/:?#@\s]+(:\d+)?(?=[/?#]|$)/i.test(r.destination)) throw new NepxError(`config.rewrites[${i}]: external destination must look like "https://host[:port]/path" (no credentials, no :params in the host)`);
-    if (!external && (!r.destination.startsWith("/") || r.destination.startsWith("//"))) throw new NepxError(`config.rewrites[${i}]: destination must be a path starting with a single "/" or an absolute http(s) URL`);
-    const match = compilePattern(r.source), when = compileConds(r.has, r.missing, `config.rewrites[${i}]`);
+    if (external && !/^https?:\/\/[^/:?#@\s]+(:\d+)?(?=[/?#]|$)/i.test(r.destination)) throw new NepxError(`${label}[${i}]: external destination must look like "https://host[:port]/path" (no credentials, no :params in the host)`);
+    if (!external && (!r.destination.startsWith("/") || r.destination.startsWith("//"))) throw new NepxError(`${label}[${i}]: destination must be a path starting with a single "/" or an absolute http(s) URL`);
+    const match = compilePattern(r.source), when = compileConds(r.has, r.missing, `${label}[${i}]`);
     return {
       match,
       resolve(pathname, search, ctx) {
@@ -101,6 +101,17 @@ export async function compileRules(cfg) {
         return dest.includes("?") ? dest : dest + search;
       },
     };
-  });
-  return { redirects, headers, rewrites };
+  };
+  // rewrites: an array (applied before routes), or the { beforeFiles, afterFiles, fallback }:
+  // beforeFiles + afterFiles run before routes match, fallback only when nothing else (page, public file) matches.
+  const raw = typeof cfg.rewrites === "function" ? await cfg.rewrites() : cfg.rewrites;
+  let rewrites, fallbackRewrites = [];
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const unknown = Object.keys(raw).filter((k) => !["beforeFiles", "afterFiles", "fallback"].includes(k));
+    if (unknown.length) throw new NepxError(`config.rewrites: unknown key "${unknown[0]}" (use beforeFiles, afterFiles, fallback)`);
+    const part = async (k) => (await resolveList(raw[k], `rewrites.${k}`)).map((r, i) => compileRewrite(r, i, `config.rewrites.${k}`));
+    rewrites = [...(await part("beforeFiles")), ...(await part("afterFiles"))];
+    fallbackRewrites = await part("fallback");
+  } else rewrites = (await resolveList(raw, "rewrites")).map((r, i) => compileRewrite(r, i, "config.rewrites"));
+  return { redirects, headers, rewrites, fallbackRewrites };
 }

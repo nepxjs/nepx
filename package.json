@@ -1,29 +1,70 @@
 {
   "name": "nepxjs",
-  "version": "1.6.0",
-  "description": "Nepx.js - Simple to Build. Fast to Run.",
+  "version": "1.8.12",
+  "description": "Nepx.js - Simple to Build. Fast to Run. A lightweight React framework with file-based routing, SSR, API routes and server actions.",
+  "keywords": [
+    "nepx",
+    "nepxjs",
+    "react",
+    "framework",
+    "ssr",
+    "file-based-routing",
+    "server-actions",
+    "fullstack",
+    "esbuild",
+    "react-alternative",
+    "typescript",
+    "static-site-generation",
+    "isr",
+    "middleware",
+    "react-19"
+  ],
+  "license": "MIT",
+  "author": "Rapp",
   "type": "module",
-  "bin": {
-    "nepx": "./bin/nepx.js"
-  },
   "exports": {
     ".": {
       "types": "./index.d.ts",
       "default": "./src/index.js"
-    }
+    },
+    "./cli": "./src/cli.js",
+    "./package.json": "./package.json"
   },
-  "engines": {
-    "node": ">=20.6"
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "bin": {
+    "nepx": "bin/nepx.js"
   },
+  "directories": {
+    "test": "tests"
+  },
+  "files": [
+    "bin",
+    "src",
+    "index.d.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node --test \"tests/*.test.js\""
+    "test": "node --test \"tests/*.test.js\"",
+    "pretest": "node scripts/check-deps.mjs",
+    "build": "node scripts/build.mjs",
+    "pack:check": "npm run build && npm pack ./dist --dry-run",
+    "release": "npm test && npm run build && npm publish ./dist --access public",
+    "prepublishOnly": "node -e \"console.error('Do not publish from the repo root (ships raw source). Use: npm run release');process.exit(1)\""
   },
   "dependencies": {
     "esbuild": "^0.27.0 || ^0.28.0"
   },
-  "peerDependencies": {
+  "devDependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sharp": ">=0.33.0"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -31,14 +72,16 @@
     },
     "react-dom": {
       "optional": true
+    },
+    "sharp": {
+      "optional": true
     }
   },
-  "license": "MIT",
-  "types": "./index.d.ts",
-  "files": [
-    "bin",
-    "src",
-    "index.d.ts",
-    "README.md"
-  ]
+  "engines": {
+    "node": ">=20.6"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false
 }

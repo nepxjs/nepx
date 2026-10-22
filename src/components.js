@@ -1,39 +1,83 @@
 // next/image, next/script and next/dynamic equivalents. Isomorphic (server render + browser).
 import { createElement as h, useContext, useEffect, useRef, useState, lazy, Suspense } from "react";
 import { RouterContext, withBase, navigate } from "./link.js";
+import { matchRemote } from "./remote-match.js";
 
 // ---------------------------------------------------------------------------------------------- Image
 const dim = (v) => (v === undefined ? undefined : Number(v));
-/**
- * <Image src alt width height> - an <img> with the performance defaults: lazy loading, async decoding, reserved space (no layout shift),
- * `priority` for the LCP image, `fill` for a parent-sized image, `placeholder="blur"` with `blurDataURL`.
- * Nepx does not resize or re-encode images (no `sharp` pipeline): `quality` and `unoptimized` are accepted and ignored.
- */
-export function Image({ src, alt, width, height, fill = false, priority = false, loading, sizes, quality, placeholder = "empty", blurDataURL, unoptimized, style, className, onLoad, ref: userRef, ...rest }) {
-  const base = useContext(RouterContext).basePath || "";
-  const imgRef = useRef(null);
-  const [loaded, setLoaded] = useState(false);
+
+// What getImageProps() uses when it is called outside a component (no router context): the server renderer and the browser runtime set it.
+let imageDefaults = { basePath: "", images: null };
+export const setImageDefaults = (d) => { imageDefaults = { basePath: (d && d.basePath) || "", images: (d && d.images) || null }; };
+
+/** The pure part of <Image>: validates the props and works out src / srcSet / sizes / dimensions / loading hints. */
+function buildImage({ src, alt, width, height, fill = false, priority = false, loading, sizes, quality, placeholder = "empty", blurDataURL, unoptimized }, base, opt) {
   if (src && typeof src === "object" && typeof src.src === "string") { width ??= src.width; height ??= src.height; src = src.src; }
   if (typeof src !== "string" || !src) throw new TypeError('<Image> needs a "src" string (a path under public/, an imported image or an absolute URL)');
   if (alt === undefined) throw new TypeError('<Image> needs an "alt" (use alt="" for a decorative image)');
   if (!fill && (!Number.isFinite(dim(width)) || !Number.isFinite(dim(height)))) throw new TypeError(`<Image src="${src}"> needs "width" and "height" (or the "fill" prop)`);
   if (fill && (width !== undefined || height !== undefined)) throw new TypeError(`<Image src="${src}"> cannot have both "fill" and "width"/"height"`);
   if (placeholder === "blur" && !blurDataURL) throw new TypeError(`<Image src="${src}" placeholder="blur"> needs "blurDataURL"`);
-  const blur = placeholder === "blur" && !loaded ? { backgroundImage: `url(${JSON.stringify(blurDataURL)})`, backgroundSize: "cover", backgroundRepeat: "no-repeat", backgroundPosition: "center" } : null;
-  const fillStyle = fill ? { position: "absolute", inset: 0, width: "100%", height: "100%" } : null;
+  // config.images.optimize: local raster images go through /_nepx/image (resized, webp/avif); the router context carries { widths, quality }
+  let imgSrc = withBase(base, src), srcSet;
+  const remoteOk = !!opt && !unoptimized && /^https?:\/\//i.test(src) && matchRemote(src, opt.remotePatterns); // config.images.remotePatterns / domains: fetched and resized by the server
+  if (opt && !unoptimized && (remoteOk || (src.startsWith("/") && !src.startsWith("//") && /\.(jpe?g|png|webp|avif|tiff)$/i.test(src.split("?")[0])))) {
+    const q = quality === undefined ? opt.quality : quality;
+    if (!Number.isInteger(q) || q < 1 || q > 100) throw new TypeError(`<Image src="${src}"> quality must be an integer between 1 and 100`);
+    const u = (w) => withBase(base, `/_nepx/image?url=${encodeURIComponent(src)}&w=${w}&q=${q}`);
+    const widths = opt.widths, biggest = widths[widths.length - 1];
+    const atLeast = (n) => widths.find((x) => x >= n) ?? biggest;
+    if (fill || sizes) { srcSet = widths.map((w) => `${u(w)} ${w}w`).join(", "); imgSrc = u(biggest); }
+    else { const w1 = atLeast(dim(width)), w2 = atLeast(dim(width) * 2); srcSet = `${u(w1)} 1x, ${u(w2)} 2x`; imgSrc = u(w2); }
+  }
+  return {
+    src: imgSrc, srcSet, alt, sizes,
+    width: fill ? undefined : dim(width), height: fill ? undefined : dim(height),
+    loading: priority ? "eager" : loading ?? "lazy", decoding: "async", fetchPriority: priority ? "high" : undefined,
+    style: fill ? { position: "absolute", inset: 0, width: "100%", height: "100%" } : undefined,
+    blur: placeholder === "blur" ? blurDataURL : null,
+  };
+}
+
+/**
+ * <Image src alt width height> - an <img> with the performance defaults: lazy loading, async decoding, reserved space (no layout shift),
+ * `priority` for the LCP image, `fill` for a parent-sized image, `placeholder="blur"` with `blurDataURL`.
+ * With `images: { optimize: true }` in nepx.config.js, local raster images are served resized (webp/avif) from /_nepx/image with a srcSet;
+ * `quality` (1-100) tunes that and `unoptimized` skips it. Without the option the file is used as it is.
+ */
+export function Image({ src, alt, width, height, fill = false, priority = false, loading, sizes, quality, placeholder = "empty", blurDataURL, unoptimized, style, className, onLoad, ref: userRef, ...rest }) {
+  const ctx = useContext(RouterContext);
+  const imgRef = useRef(null);
+  const [loaded, setLoaded] = useState(false);
+  const { blur: blurSrc, style: fillStyle, ...img } = buildImage({ src, alt, width, height, fill, priority, loading, sizes, quality, placeholder, blurDataURL, unoptimized }, ctx.basePath || "", ctx.images);
+  const blur = blurSrc && !loaded ? { backgroundImage: `url(${JSON.stringify(blurSrc)})`, backgroundSize: "cover", backgroundRepeat: "no-repeat", backgroundPosition: "center" } : null;
   const setRef = (node) => {
     imgRef.current = node;
     if (typeof userRef === "function") userRef(node); else if (userRef) userRef.current = node;
     if (node && node.complete && node.naturalWidth > 0) setLoaded(true); // loaded before hydration
   };
   return h("img", {
-    ...rest, ref: setRef, src: withBase(base, src), alt, sizes, className,
-    width: fill ? undefined : dim(width), height: fill ? undefined : dim(height),
-    loading: priority ? "eager" : loading ?? "lazy", decoding: "async", fetchPriority: priority ? "high" : undefined,
+    ...rest, ref: setRef, ...img, className,
     style: { ...fillStyle, ...blur, ...style },
     onLoad(e) { setLoaded(true); if (onLoad) onLoad(e); },
   });
 }
+
+/**
+ * getImageProps(props, { basePath?, images? }) - next/image's escape hatch: the props <Image> would put on its <img>
+ * ({ src, srcSet, sizes, width, height, loading, decoding, fetchPriority, style, alt }), for <picture>, background images or meta tags.
+ * Returns { props }. Uses the app's basePath / images config; the optional 2nd argument overrides them.
+ */
+export function getImageProps(input, ctx = {}) {
+  const { src, alt, width, height, fill, priority, loading, sizes, quality, placeholder, blurDataURL, unoptimized, style, className, onLoad, ref, ...rest } = input || {};
+  const { blur, style: fillStyle, ...img } = buildImage({ src, alt, width, height, fill, priority, loading, sizes, quality, placeholder, blurDataURL, unoptimized }, ctx.basePath ?? imageDefaults.basePath, "images" in ctx ? ctx.images : imageDefaults.images);
+  const blurStyle = blur ? { backgroundImage: `url(${JSON.stringify(blur)})`, backgroundSize: "cover", backgroundRepeat: "no-repeat", backgroundPosition: "center" } : null;
+  const out = { ...rest, ...img, className, style: { ...fillStyle, ...blurStyle, ...style } };
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return { props: out };
+}
+/** Older name for getImageProps. */
+export const unstable_getImgProps = getImageProps;
 
 // ---------------------------------------------------------------------------------------------- Script
 const scriptState = new Map(); // key -> { status: "loading" | "done" | "error", waiters: [] }

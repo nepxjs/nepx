@@ -1,4 +1,5 @@
 import { HttpError } from "../errors/index.js";
+import { createHash } from "node:crypto";
 import { MIME } from "../mime.js";
 
 export { MIME };
@@ -57,3 +58,29 @@ export function jsonResponse(status, body, extra = {}) {
 }
 
 export const htmlResponse = (status, html, extra = {}) => new Response(html, { status, headers: { "content-type": MIME[".html"], "cache-control": "no-cache", ...extra } });
+
+/** Weak validator for a body: W/"<size>-<sha1 prefix>". */
+const etagCache = new WeakMap(); // bundled assets are served over and over: hash each body once
+export function etagOf(body) {
+  if (typeof body === "object" && body && etagCache.has(body)) return etagCache.get(body);
+  const buf = typeof body === "string" ? Buffer.from(body) : body;
+  const tag = `W/"${buf.length.toString(16)}-${createHash("sha1").update(buf).digest("base64url").slice(0, 16)}"`;
+  if (typeof body === "object" && body) etagCache.set(body, tag);
+  return tag;
+}
+
+/** True when the request's If-None-Match matches `etag` (or is "*"). Request headers are Node-style (lower-case keys). */
+export function etagMatches(reqHeaders, etag) {
+  const inm = reqHeaders && reqHeaders["if-none-match"];
+  if (!inm) return false;
+  const strip = (t) => t.trim().replace(/^W\//, "");
+  return inm.trim() === "*" || inm.split(",").some((t) => strip(t) === strip(etag));
+}
+
+/** 200 with an ETag, or a bodiless 304 when the client already has this exact body. HEAD gets headers only. */
+export function conditionalResponse(req, body, headers) {
+  const etag = etagOf(body);
+  const h = { ...headers, etag };
+  if (etagMatches(req.headers, etag)) return new Response(null, { status: 304, headers: { etag, "cache-control": h["cache-control"] } });
+  return new Response(req.method === "HEAD" ? null : body, { status: 200, headers: h });
+}

@@ -4,9 +4,10 @@ import { existsSync, statSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { ASSET_EXT, assetUrl } from "./assets.js";
+import { ASSET_EXT, assetUrl, assetBase } from "./assets.js";
 import { cssModule } from "./cssmodules.js";
 import { createTransformCache } from "./turbo.js";
+import { mentionsUseCache, transformUseCache } from "./use-cache.js";
 
 const PKG_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PKG_URL = pathToFileURL(PKG_DIR + path.sep).href;
@@ -17,11 +18,13 @@ let root = process.cwd();
 let projectRequire = null;
 let aliasBase = root;
 let basePath = "";
+let transpile = []; // config.transpilePackages: node_modules packages whose source (TS/JSX/.js with JSX) is compiled like app code
 let diskCache = null; // turbo: transformed source cached on disk, keyed by content
 
 export function initialize(data) {
   root = data.root;
   basePath = data.basePath || "";
+  transpile = data.transpile || [];
   diskCache = data.cacheDir ? createTransformCache(data.cacheDir) : null;
   projectRequire = createRequire(path.join(root, "package.json"));
   aliasBase = existsSync(path.join(root, "src", "app")) ? path.join(root, "src") : root;
@@ -44,7 +47,7 @@ export async function resolve(specifier, context, nextResolve) {
   let abs = null;
   if (specifier.startsWith("@/")) {
     // Inside a production build (.nepx/server) "@/" points at the copied tree, not the original sources.
-    const built = path.join(root, ".nepx", "server");
+    const built = path.join(root, process.env.NEPX_DIST_DIR || ".nepx", "server");
     const parent = context.parentURL?.startsWith("file:") ? fileURLToPath(context.parentURL) : "";
     const base = parent.startsWith(built + path.sep) ? (existsSync(path.join(built, "src", "app")) ? path.join(built, "src") : built) : aliasBase;
     abs = path.join(base, specifier.slice(2));
@@ -62,7 +65,12 @@ export async function resolve(specifier, context, nextResolve) {
 function shouldTransform(file) {
   const ext = path.extname(file);
   if (!LOADERS[ext]) return false;
-  if (file.includes(`${path.sep}node_modules${path.sep}`)) return false;
+  const nm = `${path.sep}node_modules${path.sep}`;
+  if (file.includes(nm)) { // only packages listed in config.transpilePackages (the last node_modules segment decides, so nested deps work)
+    const tail = file.slice(file.lastIndexOf(nm) + nm.length).split(path.sep);
+    const name = tail[0].startsWith("@") ? tail[0] + "/" + tail[1] : tail[0];
+    return transpile.includes(name);
+  }
   if (ext === ".js" && (file.startsWith(PKG_DIR + path.sep))) return false; // Nepx's own files
   return true;
 }
@@ -78,19 +86,23 @@ export async function load(url, context, nextLoad) {
   const pathname = new URL(url).pathname;
   const file = fileURLToPath(new URL(url.split("?")[0]));
   if (pathname.endsWith(".module.css")) { // same class names as the client build: the path is taken relative to the code root
-    const built = path.join(root, ".nepx", "server");
+    const built = path.join(root, process.env.NEPX_DIST_DIR || ".nepx", "server");
     const rel = (file.startsWith(built + path.sep) ? path.relative(built, file) : path.relative(root, file)).split(path.sep).join("/");
     const { map } = cssModule(await readFile(file, "utf8"), rel);
     return { format: "module", source: `export default ${JSON.stringify(map)};`, shortCircuit: true };
   }
   if (pathname.endsWith(".css")) return { format: "module", source: "export default {};", shortCircuit: true }; // styles are bundled for the browser only
-  if (ASSET_EXT.test(pathname)) return { format: "module", source: `export default ${JSON.stringify(assetUrl(file, await readFile(file), basePath))};`, shortCircuit: true };
+  if (ASSET_EXT.test(pathname)) return { format: "module", source: `export default ${JSON.stringify(assetUrl(file, await readFile(file), assetBase(basePath)))};`, shortCircuit: true };
   if (!shouldTransform(file)) return nextLoad(url, context);
-  const source = await readFile(file, "utf8");
+  let source = await readFile(file, "utf8");
+  if (mentionsUseCache(source)) { // "use cache" functions go through the data cache (use-cache.js)
+    try { source = transformUseCache(source, path.relative(root, file).split(path.sep).join("/")); }
+    catch (err) { throw new SyntaxError(`${file}: ${err.message}`); }
+  }
   const es = await getEsbuild();
   if (!es) {
     if (path.extname(file) === ".js") return nextLoad(url, context);
-    return { format: "module", source, shortCircuit: true }; // esbuild missing: plain JS only
+    throw new SyntaxError(`${file}: esbuild is required to load ${path.extname(file)} files. Run "npm install".`);
   }
   const loader = LOADERS[path.extname(file)];
   const cacheKey = diskCache?.key([es.version, loader, file, source]);
